@@ -1,0 +1,175 @@
+name: dump-v1t-encoding
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: '自博弈局数'
+        default: '25'
+jobs:
+  dump:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: pip install numpy
+      - name: Dump encoder_v1t behavior
+        run: |
+          cat > dump_v1t.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """DanLM 引擎/编码器行为 dump：自博弈随机走子，逐步导出 encode_batch 的 964 维输入与
+          引擎原生 80 维出牌矩阵，供跨引擎对拍校准。"""
+          import dataclasses, inspect, json, sys
+          import numpy as np
+
+          OUT = open('dump.jsonl', 'w', encoding='utf-8')
+
+          def emit(obj):
+              OUT.write(json.dumps(obj, ensure_ascii=False, default=_ser) + '\n')
+
+          def _ser(o):
+              if isinstance(o, np.ndarray):
+                  return o.tolist()
+              if isinstance(o, (np.integer,)):
+                  return int(o)
+              if isinstance(o, (np.floating,)):
+                  return float(o)
+              if isinstance(o, bytes):
+                  return o.decode('utf-8', 'replace')
+              return str(o)
+
+          def dump_obj(o, depth=0):
+              """数据类/对象防御性序列化：numpy -> list，未知对象 -> repr。"""
+              if o is None or isinstance(o, (int, float, str, bool)):
+                  return o
+              if isinstance(o, np.ndarray):
+                  return o.tolist()
+              if isinstance(o, (list, tuple)):
+                  return [dump_obj(x, depth + 1) for x in o]
+              if isinstance(o, dict):
+                  return {str(k): dump_obj(v, depth + 1) for k, v in o.items()}
+              if dataclasses.is_dataclass(o):
+                  return {f.name: dump_obj(getattr(o, f.name, None), depth + 1) for f in dataclasses.fields(o)}
+              if depth < 2:
+                  try:
+                      return {k: dump_obj(v, depth + 1) for k, v in vars(o).items()}
+                  except Exception:
+                      return repr(o)
+              return repr(o)
+
+          from danzero.engine.game import GuanDanRound
+          from danzero.encoding import get_encoder
+          enc = get_encoder('v1t')
+          print('encoder ok:', enc.DIM_STATE, enc.DIM_ACTION, enc.DIM_INPUT)
+
+          rng = np.random.default_rng(2026)
+
+          def deal_two_decks():
+              deck = [c for c in range(54) for _ in range(2)]
+              rng.shuffle(deck)
+              return [np.bincount(deck[i * 27:(i + 1) * 27], minlength=54).astype(np.int8) for i in range(4)]
+
+          GAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 25
+          records = 0
+          for g in range(GAMES):
+              hands = deal_two_decks()
+              level = int(rng.integers(2, 15))
+              first = int(rng.integers(0, 4))
+              team_levels = (int(rng.integers(2, 15)), int(rng.integers(2, 15)))
+              # 构造 round：签名未知，多形态尝试
+              round_obj = None
+              attempts = [
+                  lambda: GuanDanRound(level=level, hands=[h.copy() for h in hands], first_player=first, team_levels=team_levels),
+                  lambda: GuanDanRound(level, [h.copy() for h in hands], first, team_levels),
+                  lambda: GuanDanRound(level=level, hands=[h.copy() for h in hands], first_player=first),
+                  lambda: GuanDanRound(level, [h.copy() for h in hands], first),
+                  lambda: GuanDanRound(level, [h.copy() for h in hands]),
+                  lambda: GuanDanRound(level),
+              ]
+              err = None
+              for make in attempts:
+                  try:
+                      round_obj = make()
+                      break
+                  except Exception as e:
+                      err = e
+              if round_obj is None:
+                  emit({'type': 'ctor_fail', 'game': g, 'error': str(err),
+                        'sig': str(inspect.signature(GuanDanRound.__init__))})
+                  print('GuanDanRound 构造失败:', err)
+                  break
+              try:
+                  obs = round_obj.get_observation()
+              except Exception:
+                  obs = round_obj.state
+              step = 0
+              history = []
+              while obs is not None and step < 220:
+                  legal = None
+                  try:
+                      legal = np.asarray(obs.legal_plays, dtype=np.float32)
+                  except Exception:
+                      pass
+                  state = None
+                  batch = None
+                  try:
+                      state, actions = enc.encode_observation(obs)
+                      state = np.asarray(state, dtype=np.float32)
+                  except Exception as e:
+                      emit({'type': 'encode_fail', 'game': g, 'step': step, 'error': str(e)})
+                      break
+                  try:
+                      batch = np.asarray(enc.encode_batch(obs), dtype=np.float32)
+                  except Exception:
+                      batch = None
+                  rec = {
+                      'type': 'decision', 'game': g, 'step': step,
+                      'level': level, 'first_player': first,
+                      'deal_hands': [h.tolist() for h in hands],
+                      'team_levels': team_levels,
+                      'history': history[-120:],
+                      'state_v1t': state.tolist(),
+                      'legal_plays': legal.tolist() if legal is not None else None,
+                      'batch': None if batch is None else batch.tolist(),
+                      'obs': dump_obj(obs),
+                  }
+                  emit(rec)
+                  records += 1
+                  # 随机走子：优先非 PASS（row0 约定待证），保证动作多样性
+                  n = 0 if legal is None else len(legal)
+                  if n == 0:
+                      break
+                  choice = int(rng.integers(0, n))
+                  if n > 1 and choice == 0 and rng.random() < 0.75:
+                      choice = int(rng.integers(1, n))
+                  try:
+                      history.append({'player': int(getattr(obs, 'player', -1)), 'row': legal[choice].tolist()})
+                  except Exception:
+                      history.append({'player': -1, 'row': None})
+                  obs_next = None
+                  try:
+                      obs_next = round_obj.step(choice, obs=obs)
+                  except TypeError:
+                      obs_next = round_obj.step(choice)
+                  except Exception as e:
+                      emit({'type': 'step_fail', 'game': g, 'step': step, 'error': str(e)})
+                      break
+                  obs = obs_next
+                  step += 1
+              emit({'type': 'game_done', 'game': g, 'steps': step})
+          emit({'type': 'summary', 'records': records, 'games': GAMES})
+          OUT.close()
+          print('records:', records)
+          PYEOF
+          python dump_v1t.py "${{ github.event.inputs.games || 25 }}"
+      - name: Smoke check
+        run: |
+          wc -l dump.jsonl
+          head -c 400 dump.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: danlm-v1t-dump
+          path: dump.jsonl
